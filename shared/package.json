@@ -2,8 +2,16 @@
   "name": "@space-game/shared",
   "version": "1.0.0",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.test.json"
+  },
   "exports": {
-    "./simulation": "./src/simulation.js",
-    "./protocol": "./src/protocol.js"
+    "./types": "./src/types.ts",
+    "./schemas": "./src/schemas.ts",
+    "./simulation": "./src/simulation.ts",
+    "./protocol": "./src/protocol.ts"
+  },
+  "dependencies": {
+    "zod": "^3.24.0"
   }
 }

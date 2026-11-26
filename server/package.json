@@ -3,10 +3,13 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js"
+    "dev": "node --experimental-strip-types --watch src/index.ts",
+    "start": "node --experimental-strip-types src/index.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "@space-game/shared": "*",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
   }
 }

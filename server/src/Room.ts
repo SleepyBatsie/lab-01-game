@@ -1,34 +1,57 @@
 import { EventEmitter } from 'node:events';
-import { MatchLogger } from './matchLogger.js';
-import { config } from './config.js';
+import type { WebSocket } from 'ws';
+import { MatchLogger } from './matchLogger.ts';
+import { config } from './config.ts';
+import type { PlayerId, RoomId, PlayerInput } from '@space-game/shared/types';
 import {
   TICK_RATE,
   FIXED_DT,
   createInitialState,
   addPlayerToState,
   removePlayerFromState,
-  stepWorld
+  stepWorld,
+  buildWorldSnapshot,
+  type WorldState
 } from '@space-game/shared/simulation';
 import { encodeSnapshotBinary } from '@space-game/shared/protocol';
 
 const STEP_MS = 1000 / TICK_RATE;
 
-export class Room extends EventEmitter {
-  constructor(id, name = `Room ${id}`) {
+export interface RoomClientInfo {
+  readonly id: PlayerId;
+  readonly nickname: string;
+  readonly slot: number;
+  useBinary: boolean;
+  readonly inputQueue: PlayerInput[];
+  lastInput: PlayerInput | null;
+}
+
+export interface RoomEvents {
+  empty: [roomId: RoomId];
+  error: [err: unknown];
+}
+
+export class Room extends EventEmitter<RoomEvents> {
+  public readonly id: RoomId;
+  public readonly name: string;
+  private readonly clients = new Map<WebSocket, RoomClientInfo>();
+  private readonly logger: MatchLogger;
+  private readonly state: WorldState;
+  private running = true;
+  private tickTimer: NodeJS.Timeout | null = null;
+  private nextTickAt: number;
+
+  constructor(id: RoomId, name = `Room ${id}`) {
     super();
     this.id = id;
     this.name = name;
-    this.clients = new Map();
     this.logger = new MatchLogger(id);
 
     const seed = Math.floor(Math.random() * 1000000);
     this.state = createInitialState(seed);
-
-    this.running = true;
-    this.tickTimer = null;
     this.nextTickAt = performance.now() + STEP_MS;
 
-    this.on('error', (err) => {
+    this.on('error', (err: unknown) => {
       console.error(`[Room ${this.id}] Error:`, err);
     });
 
@@ -36,11 +59,11 @@ export class Room extends EventEmitter {
     this.scheduleNextTick();
   }
 
-  get size() {
+  public get size(): number {
     return this.clients.size;
   }
 
-  scheduleNextTick() {
+  private scheduleNextTick(): void {
     if (!this.running) return;
     const now = performance.now();
     const delay = Math.max(0, this.nextTickAt - now);
@@ -56,13 +79,14 @@ export class Room extends EventEmitter {
     }, delay);
   }
 
-  stepSimulation() {
+  private stepSimulation(): void {
     if (this.clients.size === 0) return;
 
-    const inputsByPlayerId = new Map();
-    for (const [, info] of this.clients) {
-      if (info.inputQueue.length > 0) {
-        inputsByPlayerId.set(info.id, info.inputQueue.shift());
+    const inputsByPlayerId = new Map<PlayerId, PlayerInput>();
+    for (const info of this.clients.values()) {
+      const nextInput = info.inputQueue.shift();
+      if (nextInput) {
+        inputsByPlayerId.set(info.id, nextInput);
       } else if (info.lastInput) {
         inputsByPlayerId.set(info.id, { ...info.lastInput, fire: false });
       }
@@ -72,7 +96,7 @@ export class Room extends EventEmitter {
     this.broadcastSnapshot();
   }
 
-  enqueueInput(ws, input) {
+  public enqueueInput(ws: WebSocket, input: PlayerInput): void {
     const info = this.clients.get(ws);
     if (!info) return;
     if (info.inputQueue.length < 15) {
@@ -81,19 +105,20 @@ export class Room extends EventEmitter {
     info.lastInput = input;
   }
 
-  setProtocolMode(ws, useBinary) {
+  public setProtocolMode(ws: WebSocket, useBinary: boolean): void {
     const info = this.clients.get(ws);
     if (info) {
-      info.useBinary = Boolean(useBinary);
+      info.useBinary = useBinary;
     }
   }
 
-  addClient(ws, playerInfo) {
+  public addClient(ws: WebSocket, playerInfo: { readonly id: PlayerId; readonly nickname: string }): void {
     const usedSlots = new Set(Array.from(this.clients.values()).map((c) => c.slot));
     const slot = usedSlots.has(0) ? 1 : 0;
 
-    const fullInfo = {
-      ...playerInfo,
+    const fullInfo: RoomClientInfo = {
+      id: playerInfo.id,
+      nickname: playerInfo.nickname,
       slot,
       useBinary: true,
       inputQueue: [],
@@ -119,7 +144,7 @@ export class Room extends EventEmitter {
     });
   }
 
-  removeClient(ws) {
+  public removeClient(ws: WebSocket): void {
     const player = this.clients.get(ws);
     if (!player) return;
 
@@ -128,7 +153,7 @@ export class Room extends EventEmitter {
     this.logger.logEvent({ type: 'leave', player: { id: player.id, nickname: player.nickname } });
 
     if (this.clients.size === 0) {
-      this.close().then(() => {
+      void this.close().then(() => {
         this.emit('empty', this.id);
       });
     } else {
@@ -140,7 +165,7 @@ export class Room extends EventEmitter {
     }
   }
 
-  handleChat(ws, text) {
+  public handleChat(ws: WebSocket, text: string): void {
     const player = this.clients.get(ws);
     if (!player) return;
 
@@ -156,46 +181,40 @@ export class Room extends EventEmitter {
     this.broadcast(payload);
   }
 
-  broadcastSnapshot() {
-    const snapshotObj = {
-      type: 'snapshot',
-      tick: this.state.tick,
-      serverTime: performance.now(),
-      players: Object.values(this.state.players),
-      bullets: this.state.bullets
-    };
+  private broadcastSnapshot(): void {
+    const snapshot = buildWorldSnapshot(this.state, performance.now());
 
-    let binaryBuf = null;
-    let jsonStr = null;
+    let binaryBuf: ArrayBuffer | null = null;
+    let jsonStr: string | null = null;
 
     for (const [clientWs, info] of this.clients) {
       if (clientWs.readyState !== 1) continue;
       if (clientWs.bufferedAmount > config.maxBufferedAmount) continue;
 
       if (info.useBinary) {
-        if (!binaryBuf) binaryBuf = encodeSnapshotBinary(snapshotObj);
+        if (!binaryBuf) binaryBuf = encodeSnapshotBinary(snapshot);
         clientWs.send(binaryBuf);
       } else {
-        if (!jsonStr) jsonStr = JSON.stringify(snapshotObj);
+        if (!jsonStr) jsonStr = JSON.stringify(snapshot);
         clientWs.send(jsonStr);
       }
     }
   }
 
-  broadcast(data, excludeWs = null) {
+  public broadcast(data: unknown, excludeWs: WebSocket | null = null): void {
     const raw = JSON.stringify(data);
-    for (const [clientWs] of this.clients) {
+    for (const clientWs of this.clients.keys()) {
       if (clientWs === excludeWs || clientWs.readyState !== 1) continue;
       if (clientWs.bufferedAmount > config.maxBufferedAmount) continue;
       clientWs.send(raw);
     }
   }
 
-  getPlayersList() {
+  public getPlayersList(): Array<{ id: PlayerId; nickname: string; slot: number }> {
     return Array.from(this.clients.values()).map(({ id, nickname, slot }) => ({ id, nickname, slot }));
   }
 
-  toJSON() {
+  public toJSON(): { id: RoomId; name: string; playersCount: number; logFile: string } {
     return {
       id: this.id,
       name: this.name,
@@ -204,9 +223,9 @@ export class Room extends EventEmitter {
     };
   }
 
-  async close() {
+  public async close(): Promise<void> {
     this.running = false;
-    clearTimeout(this.tickTimer);
+    if (this.tickTimer) clearTimeout(this.tickTimer);
     this.logger.logEvent({ type: 'room_closed', roomId: this.id });
     await this.logger.close();
   }
