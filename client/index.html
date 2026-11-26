@@ -1,82 +1,98 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="uk">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Lab 05 - Prediction, Reconciliation & Binary Protocol</title>
+    <title>Space Arena — Multiplayer (Lab 07)</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
     <div id="app">
-      <div class="canvas-container">
-        <canvas id="canvas"></canvas>
+      <header class="topbar">
+        <h1>Space Arena (Lab 07: V8, Pool & Tests)</h1>
         <div class="hud">
-          <div>FPS: <span id="fps">0</span> | HP: <span id="hp">5</span> | Score: <span id="score">0</span></div>
-          <div style="font-size: 11px; opacity: 0.75; margin-top: 3px;">
-            W/Up: Газ | A/D або Left/Right: Поворот | Space: Постріл
+          <span>FPS: <strong id="fps">0</strong></span>
+          <span>Frame p50/p95/p99: <strong id="frame-pct">0/0/0</strong> ms</span>
+          <span>HP: <strong id="hp">5</strong></span>
+          <span>Score: <strong id="score">0</strong></span>
+          <span id="ws-status" class="badge offline">disconnected</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <div class="canvas-wrapper">
+          <canvas id="canvas" width="800" height="600"></canvas>
+
+          <div id="netgraph" class="netgraph">
+            <div class="ng-title">NETGRAPH &amp; PERF</div>
+            <div>Proto: <strong id="ng-proto">BINARY</strong></div>
+            <div>RTT: <strong id="ng-rtt">0</strong> ms (Sim: <strong id="ng-sim-rtt">0</strong> ms)</div>
+            <div>Snap age: <strong id="ng-snap-age">0</strong> ms</div>
+            <div>TX / RX: <strong id="ng-tx">0</strong> / <strong id="ng-rx">0</strong> B/s</div>
+            <div>Pending inputs: <strong id="ng-queue">0</strong></div>
+            <div>Reconcile err: <strong id="ng-err">0.0</strong> px</div>
           </div>
         </div>
 
-        <!-- Netgraph на екрані -->
-        <div class="netgraph">
-          <div class="ng-title">NETGRAPH (<span id="ng-proto">BINARY</span>)</div>
-          <div>RTT: <span id="ng-rtt">0</span> ms (sim +<span id="ng-sim-rtt">0</span> ms)</div>
-          <div>Вік знімка: <span id="ng-snap-age">0</span> ms</div>
-          <div>Трафік: TX <span id="ng-tx">0</span> B/s | RX <span id="ng-rx">0</span> B/s</div>
-          <div>Черга input: <span id="ng-queue">0</span> шт.</div>
-          <div>Поправка (err): <span id="ng-err">0.00</span> px</div>
-        </div>
-      </div>
+        <aside class="sidebar">
+          <div class="panel">
+            <h3>Мережа, пули та боти</h3>
+            <label class="toggle-row">
+              <input id="chk-binary" type="checkbox" checked />
+              <span>Бінарний протокол (ArrayBuffer)</span>
+            </label>
+            <label class="toggle-row">
+              <input id="chk-prediction" type="checkbox" checked />
+              <span>Prediction + Reconciliation</span>
+            </label>
+            <label class="toggle-row">
+              <input id="chk-worker" type="checkbox" />
+              <span>Винести частинки у Web Worker</span>
+            </label>
+            <label class="select-row">
+              <span>Емуляція мережі:</span>
+              <select id="sel-net-preset">
+                <option value="0,0,0">Ідеальна (0 ms, 0% втрат)</option>
+                <option value="80,15,0">Середня (80 ms, ±15 ms)</option>
+                <option value="180,30,3">Важка (180 ms, ±30 ms, 3% втрат)</option>
+              </select>
+            </label>
+            <div class="form-row" style="margin-top: 8px;">
+              <button id="bots-btn" type="button">Запустити 8 ботів</button>
+            </div>
+          </div>
 
-      <aside class="multiplayer-panel">
-        <div class="panel-header">
-          <h3>Мультиплеєр (Lab 05)</h3>
-          <span id="ws-status" class="badge offline">offline</span>
-        </div>
+          <section id="lobby-view" class="panel">
+            <h2>Лобі</h2>
+            <div class="form-row">
+              <input id="nickname-input" type="text" placeholder="Ваш нікнейм" maxlength="20" />
+            </div>
+            <div class="form-row">
+              <input id="room-input" type="text" placeholder="Назва кімнати (напр. arena)" value="arena" maxlength="32" />
+              <button id="join-btn" type="button">Увійти</button>
+            </div>
+            <h3>Активні кімнати</h3>
+            <ul id="rooms-list" class="rooms-list">
+              <li class="empty">Завантаження...</li>
+            </ul>
+          </section>
 
-        <!-- Налаштування мережі та протоколу -->
-        <div class="net-controls">
-          <div class="control-row">
-            <label><input type="checkbox" id="chk-binary" checked /> Бінарний протокол (DataView)</label>
-          </div>
-          <div class="control-row">
-            <label><input type="checkbox" id="chk-prediction" checked /> Prediction + Reconciliation</label>
-          </div>
-          <div class="control-row">
-            <span>Затримка (RTT):</span>
-            <select id="sel-net-preset">
-              <option value="0,0,0">0 ms (Ідеал)</option>
-              <option value="100,0,0">100 ms (Середня)</option>
-              <option value="150,30,5">150 ms ±30ms, 5% втрат</option>
-            </select>
-          </div>
-        </div>
-
-        <div id="lobby-view">
-          <input type="text" id="nickname-input" placeholder="Ваш нікнейм" maxlength="20" />
-          <div class="row">
-            <input type="text" id="room-input" placeholder="Кімната (напр. arena)" maxlength="20" />
-            <button id="join-btn">Увійти</button>
-          </div>
-          <div class="rooms-list-header">Активні кімнати:</div>
-          <ul id="rooms-list">
-            <li class="empty">Завантаження...</li>
-          </ul>
-        </div>
-
-        <div id="room-view" class="hidden">
-          <div class="room-bar">
-            <span>Кімната: <strong id="current-room-name"></strong></span>
-            <button id="leave-btn" class="danger">Вийти</button>
-          </div>
-          <div class="players-bar">Гравці: <span id="players-list"></span></div>
-          <div id="chat-messages" class="chat-box"></div>
-          <form id="chat-form" class="row">
-            <input type="text" id="chat-input" placeholder="Повідомлення..." maxlength="500" autocomplete="off" />
-            <button type="submit">Надіслати</button>
-          </form>
-        </div>
-      </aside>
+          <section id="room-view" class="panel hidden">
+            <div class="room-header">
+              <h2>Кімната: <span id="current-room-name"></span></h2>
+              <button id="leave-btn" type="button" class="danger">Вийти</button>
+            </div>
+            <div class="players-box">
+              <strong>Гравці:</strong> <span id="players-list">-</span>
+            </div>
+            <div id="chat-messages" class="chat-messages"></div>
+            <form id="chat-form" class="chat-form">
+              <input id="chat-input" type="text" placeholder="Повідомлення..." maxlength="500" autocomplete="off" />
+              <button type="submit">Надіслати</button>
+            </form>
+          </section>
+        </aside>
+      </main>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

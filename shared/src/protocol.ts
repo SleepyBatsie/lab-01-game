@@ -174,7 +174,7 @@ export function decodeSnapshotBinary(arrayBuffer: ArrayBuffer): WorldSnapshot {
     const angle = decodeAngleInt16(view.getInt16(offset + 22, true));
     const score = view.getUint16(offset + 24, true);
 
-    if (!Number.isFinite(x) || !Number.isFinite(y) || slot > 16 || hp > 100) {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || slot > 255 || hp > 100) {
       throw new Error('Corrupted ship values in snapshot');
     }
 

@@ -1,6 +1,9 @@
-import { setupCanvas } from './renderer.js';
-import { Lobby, type RoomSummary } from './lobby.js';
-import { GameSocket, type IncomingGameMessage } from './wsClient.js';
+import { setupCanvas } from './renderer.ts';
+import { Lobby, type RoomSummary } from './lobby.ts';
+import { GameSocket, type IncomingGameMessage } from './wsClient.ts';
+import { BotClient } from './botClient.ts';
+import { FrameTimeTracker } from './frameStats.ts';
+import { ObjectPool } from '@space-game/shared/pool';
 import {
   asSeqNumber,
   assertNever,
@@ -36,6 +39,7 @@ const canvas = getEl('canvas', HTMLCanvasElement);
 const ctx = setupCanvas(canvas, WORLD_WIDTH, WORLD_HEIGHT);
 
 const fpsEl = getEl('fps', HTMLElement);
+const framePctEl = getEl('frame-pct', HTMLElement);
 const hpEl = getEl('hp', HTMLElement);
 const scoreEl = getEl('score', HTMLElement);
 const ngProtoEl = getEl('ng-proto', HTMLElement);
@@ -49,7 +53,9 @@ const ngErrEl = getEl('ng-err', HTMLElement);
 
 const chkBinary = getEl('chk-binary', HTMLInputElement);
 const chkPrediction = getEl('chk-prediction', HTMLInputElement);
+const chkWorker = getEl('chk-worker', HTMLInputElement);
 const selNetPreset = getEl('sel-net-preset', HTMLSelectElement);
+const botsBtn = getEl('bots-btn', HTMLButtonElement);
 
 const wsStatusEl = getEl('ws-status', HTMLElement);
 const lobbyViewEl = getEl('lobby-view', HTMLElement);
@@ -67,13 +73,16 @@ const chatInput = getEl('chat-input', HTMLInputElement);
 
 const socket = new GameSocket();
 const lobby = new Lobby('/api/rooms');
+const frameTracker = new FrameTimeTracker(300);
 
 let inRoom = false;
+let currentRoomId = 'arena';
 let myPlayerId: PlayerId | null = null;
 let mySlot = 0;
 let localState: WorldState = createInitialState(12345);
 let inputSeqCounter = 0;
 const pendingInputs: PlayerInput[] = [];
+let activeBots: BotClient[] = [];
 
 let errOffsetX = 0;
 let errOffsetY = 0;
@@ -90,14 +99,64 @@ const INTERP_DELAY_MS = 100;
 const snapshotBuffer: BufferedSnapshot[] = [];
 let lastSnapshotRecvTime = 0;
 
+// Пул об'єктів для локальних куль і частинок (без алокацій під час гри)
 interface LocalBullet {
   x: number;
   y: number;
-  readonly vx: number;
-  readonly vy: number;
+  vx: number;
+  vy: number;
   life: number;
 }
+const localBulletPool = new ObjectPool<LocalBullet>(
+  64,
+  () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0 }),
+  (b) => { b.life = 0; }
+);
 const localBullets: LocalBullet[] = [];
+
+interface Particle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+}
+const particlePool = new ObjectPool<Particle>(
+  400,
+  () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0 }),
+  (p) => { p.life = 0; }
+);
+const localParticles: Particle[] = [];
+
+// Експериментальний Web Worker для розрахунку частинок
+let particleWorker: Worker | null = null;
+let workerParticlesBuffer = new Float32Array(0);
+const pendingSpawnEvents: Array<{ x: number; y: number; count: number }> = [];
+
+if (typeof Worker !== 'undefined') {
+  particleWorker = new Worker(new URL('./particleWorker.ts', import.meta.url), { type: 'module' });
+  particleWorker.onmessage = (e: MessageEvent<Float32Array>) => {
+    workerParticlesBuffer = e.data;
+  };
+}
+
+function spawnExplosion(x: number, y: number, count = 14): void {
+  if (chkWorker.checked && particleWorker) {
+    pendingSpawnEvents.push({ x, y, count });
+    return;
+  }
+  for (let i = 0; i < count; i++) {
+    const p = particlePool.acquire();
+    const angle = (Math.PI * 2 * i) / count;
+    const speed = 40 + (i % 5) * 20;
+    p.x = x;
+    p.y = y;
+    p.vx = Math.cos(angle) * speed;
+    p.vy = Math.sin(angle) * speed;
+    p.life = 0.4;
+    localParticles.push(p);
+  }
+}
 
 const keys = { left: false, right: false, thrust: false, fire: false };
 let firePressedOnce = false;
@@ -136,6 +195,23 @@ selNetPreset.addEventListener('change', () => {
   ngSimRttEl.textContent = String(delay);
 });
 
+botsBtn.addEventListener('click', () => {
+  if (activeBots.length > 0) {
+    for (const bot of activeBots) bot.stop();
+    activeBots = [];
+    botsBtn.textContent = 'Запустити 8 ботів';
+    return;
+  }
+  const targetRoom = inRoom ? currentRoomId : (roomInput.value.trim() || 'arena');
+  if (!inRoom) {
+    joinRoom(targetRoom);
+  }
+  for (let i = 0; i < 8; i++) {
+    activeBots.push(new BotClient(targetRoom, i));
+  }
+  botsBtn.textContent = 'Зупинити 8 ботів';
+});
+
 function appendChat(html: string, isSystem = false): void {
   const div = document.createElement('div');
   div.className = isSystem ? 'chat-msg system' : 'chat-msg';
@@ -170,6 +246,7 @@ socket.addEventListener('message', (e: Event) => {
 
     case 'joined': {
       inRoom = true;
+      currentRoomId = msg.roomId;
       myPlayerId = msg.playerId;
       if (!localState.players[myPlayerId]) {
         addPlayerToState(localState, myPlayerId, msg.nickname, mySlot);
@@ -237,18 +314,15 @@ function handleServerSnapshot(snap: WorldSnapshot): void {
   }
 
   if (asteroids.length > 0) {
-    localState.asteroids.splice(
-      0,
-      localState.asteroids.length,
-      ...asteroids.map((a) => ({
-        id: a.id,
-        x: a.pos.x,
-        y: a.pos.y,
-        vx: 0,
-        vy: 0,
-        radius: a.radius
-      }))
-    );
+    for (let i = 0; i < asteroids.length; i++) {
+      const a = asteroids[i];
+      const existing = localState.asteroids[i];
+      if (a && existing) {
+        existing.x = a.pos.x;
+        existing.y = a.pos.y;
+        existing.radius = a.radius;
+      }
+    }
   }
 
   snapshotBuffer.push({ recvTime: now, ships, bullets, asteroids });
@@ -258,6 +332,10 @@ function handleServerSnapshot(snap: WorldSnapshot): void {
   const localMe = myPlayerId ? localState.players[myPlayerId] : undefined;
 
   if (serverMe && localMe) {
+    if (serverMe.hp < localMe.hp) {
+      spawnExplosion(serverMe.pos.x, serverMe.pos.y, 18);
+    }
+
     while (pendingInputs.length > 0) {
       const first = pendingInputs[0];
       if (!first || first.seq > serverMe.lastProcessedSeq) break;
@@ -318,10 +396,13 @@ interface InterpolatedShip {
   readonly angle: number;
 }
 
-function getInterpolatedRemotePlayers(): InterpolatedShip[] {
+const interpolatedScratch: InterpolatedShip[] = [];
+
+function getInterpolatedRemotePlayers(): readonly InterpolatedShip[] {
+  interpolatedScratch.length = 0;
   const firstSnap = snapshotBuffer[0];
   const lastSnap = snapshotBuffer[snapshotBuffer.length - 1];
-  if (!firstSnap || !lastSnap) return [];
+  if (!firstSnap || !lastSnap) return interpolatedScratch;
 
   const renderTime = performance.now() - INTERP_DELAY_MS;
   let s0: BufferedSnapshot = firstSnap;
@@ -340,9 +421,9 @@ function getInterpolatedRemotePlayers(): InterpolatedShip[] {
   const span = s1.recvTime - s0.recvTime;
   const alpha = span > 0 ? Math.max(0, Math.min(1, (renderTime - s0.recvTime) / span)) : 1;
 
-  const remotes: InterpolatedShip[] = [];
-  for (const p1 of s1.ships) {
-    if (p1.slot === mySlot) continue;
+  for (let i = 0; i < s1.ships.length; i++) {
+    const p1 = s1.ships[i];
+    if (!p1 || p1.slot === mySlot) continue;
     const p0 = s0.ships.find((p) => p.slot === p1.slot) ?? p1;
 
     const dx = p1.pos.x - p0.pos.x;
@@ -352,9 +433,9 @@ function getInterpolatedRemotePlayers(): InterpolatedShip[] {
     const dAngle = normalizeAngle(p1.angle - p0.angle);
     const angle = normalizeAngle(p0.angle + dAngle * alpha);
 
-    remotes.push({ slot: p1.slot, hp: p1.hp, x, y, angle });
+    interpolatedScratch.push({ slot: p1.slot, hp: p1.hp, x, y, angle });
   }
-  return remotes;
+  return interpolatedScratch;
 }
 
 window.setInterval(() => {
@@ -381,13 +462,14 @@ window.setInterval(() => {
 
     if (input.fire && localMe.cooldown <= 0) {
       const BULLET_SPEED = 480;
-      localBullets.push({
-        x: wrapCoord(localMe.x + Math.cos(localMe.angle) * 18, WORLD_WIDTH),
-        y: wrapCoord(localMe.y + Math.sin(localMe.angle) * 18, WORLD_HEIGHT),
-        vx: localMe.vx + Math.cos(localMe.angle) * BULLET_SPEED,
-        vy: localMe.vy + Math.sin(localMe.angle) * BULLET_SPEED,
-        life: 0.35
-      });
+      const b = localBulletPool.acquire();
+      b.x = wrapCoord(localMe.x + Math.cos(localMe.angle) * 18, WORLD_WIDTH);
+      b.y = wrapCoord(localMe.y + Math.sin(localMe.angle) * 18, WORLD_HEIGHT);
+      b.vx = localMe.vx + Math.cos(localMe.angle) * BULLET_SPEED;
+      b.vy = localMe.vy + Math.sin(localMe.angle) * BULLET_SPEED;
+      b.life = 0.35;
+      localBullets.push(b);
+      spawnExplosion(b.x, b.y, 4);
     }
 
     applyPlayerInput(localState, localMe, input, FIXED_DT, false);
@@ -396,8 +478,10 @@ window.setInterval(() => {
 
 let lastFrameTime = performance.now();
 let fpsSmoothed = 60;
+let hudUpdateCounter = 0;
 
 function renderLoop(now: number): void {
+  const frameStart = performance.now();
   const dt = Math.min(0.1, (now - lastFrameTime) / 1000);
   lastFrameTime = now;
   if (dt > 0) fpsSmoothed = fpsSmoothed * 0.9 + (1 / dt) * 0.1;
@@ -412,7 +496,27 @@ function renderLoop(now: number): void {
     b.x = wrapCoord(b.x + b.vx * dt, WORLD_WIDTH);
     b.y = wrapCoord(b.y + b.vy * dt, WORLD_HEIGHT);
     b.life -= dt;
-    if (b.life <= 0) localBullets.splice(i, 1);
+    if (b.life <= 0) {
+      localBullets.splice(i, 1);
+      localBulletPool.release(b);
+    }
+  }
+
+  if (chkWorker.checked && particleWorker) {
+    particleWorker.postMessage({ type: 'tick', dt, spawnEvents: pendingSpawnEvents });
+    pendingSpawnEvents.length = 0;
+  } else {
+    for (let i = localParticles.length - 1; i >= 0; i--) {
+      const p = localParticles[i];
+      if (!p) continue;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) {
+        localParticles.splice(i, 1);
+        particlePool.release(p);
+      }
+    }
   }
 
   ctx.fillStyle = '#0f0f1b';
@@ -426,7 +530,9 @@ function renderLoop(now: number): void {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(WORLD_WIDTH, y); ctx.stroke();
   }
 
-  for (const ast of localState.asteroids) {
+  for (let i = 0; i < localState.asteroids.length; i++) {
+    const ast = localState.asteroids[i];
+    if (!ast) continue;
     if (!inRoom) {
       ast.x = wrapCoord(ast.x + ast.vx * dt, WORLD_WIDTH);
       ast.y = wrapCoord(ast.y + ast.vy * dt, WORLD_HEIGHT);
@@ -438,11 +544,28 @@ function renderLoop(now: number): void {
     ctx.stroke();
   }
 
+  ctx.fillStyle = '#f6ad55';
+  if (chkWorker.checked) {
+    for (let i = 0; i + 2 < workerParticlesBuffer.length; i += 3) {
+      const px = workerParticlesBuffer[i] ?? 0;
+      const py = workerParticlesBuffer[i + 1] ?? 0;
+      ctx.fillRect(px, py, 2.5, 2.5);
+    }
+  } else {
+    for (let i = 0; i < localParticles.length; i++) {
+      const p = localParticles[i];
+      if (!p) continue;
+      ctx.fillRect(p.x, p.y, 2.5, 2.5);
+    }
+  }
+
   if (inRoom) {
     const latestSnap = snapshotBuffer[snapshotBuffer.length - 1];
     if (latestSnap) {
       ctx.fillStyle = '#f6e05e';
-      for (const b of latestSnap.bullets) {
+      for (let i = 0; i < latestSnap.bullets.length; i++) {
+        const b = latestSnap.bullets[i];
+        if (!b) continue;
         ctx.beginPath();
         ctx.arc(b.pos.x, b.pos.y, 3.5, 0, Math.PI * 2);
         ctx.fill();
@@ -450,14 +573,18 @@ function renderLoop(now: number): void {
     }
 
     ctx.fillStyle = '#68d391';
-    for (const b of localBullets) {
+    for (let i = 0; i < localBullets.length; i++) {
+      const b = localBullets[i];
+      if (!b) continue;
       ctx.beginPath();
       ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
       ctx.fill();
     }
 
     const remotes = getInterpolatedRemotePlayers();
-    for (const rp of remotes) {
+    for (let i = 0; i < remotes.length; i++) {
+      const rp = remotes[i];
+      if (!rp) continue;
       drawShip(ctx, rp.x, rp.y, rp.angle, '#fc8181', `P${rp.slot + 1} (HP:${rp.hp})`);
     }
 
@@ -471,13 +598,21 @@ function renderLoop(now: number): void {
     }
   }
 
-  fpsEl.textContent = String(Math.round(fpsSmoothed));
-  ngRttEl.textContent = String(socket.rttMs);
-  ngSnapAgeEl.textContent = lastSnapshotRecvTime > 0 ? String(Math.round(now - lastSnapshotRecvTime)) : '0';
-  ngTxEl.textContent = String(socket.txBytesPerSec);
-  ngRxEl.textContent = String(socket.rxBytesPerSec);
-  ngQueueEl.textContent = String(pendingInputs.length);
-  ngErrEl.textContent = lastCorrectionMagnitude.toFixed(2);
+  const frameCostMs = performance.now() - frameStart;
+  frameTracker.record(frameCostMs);
+
+  hudUpdateCounter++;
+  if (hudUpdateCounter % 15 === 0) {
+    const pct = frameTracker.getPercentiles();
+    fpsEl.textContent = String(Math.round(fpsSmoothed));
+    framePctEl.textContent = `${pct.p50.toFixed(2)}/${pct.p95.toFixed(2)}/${pct.p99.toFixed(2)}`;
+    ngRttEl.textContent = String(socket.rttMs);
+    ngSnapAgeEl.textContent = lastSnapshotRecvTime > 0 ? String(Math.round(now - lastSnapshotRecvTime)) : '0';
+    ngTxEl.textContent = String(socket.txBytesPerSec);
+    ngRxEl.textContent = String(socket.rxBytesPerSec);
+    ngQueueEl.textContent = String(pendingInputs.length);
+    ngErrEl.textContent = lastCorrectionMagnitude.toFixed(2);
+  }
 
   requestAnimationFrame(renderLoop);
 }
@@ -533,6 +668,9 @@ joinBtn.addEventListener('click', () => {
 
 leaveBtn.addEventListener('click', () => {
   inRoom = false;
+  for (const bot of activeBots) bot.stop();
+  activeBots = [];
+  botsBtn.textContent = 'Запустити 8 ботів';
   socket.send({ type: 'leave' });
   roomViewEl.classList.add('hidden');
   lobbyViewEl.classList.remove('hidden');

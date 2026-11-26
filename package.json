@@ -12,6 +12,10 @@
     "dev:server": "npm run dev --workspace=server",
     "start": "npm start --workspace=server",
     "typecheck": "npm run typecheck --workspace=shared && npm run typecheck --workspace=server && npm run typecheck --workspace=client",
-    "test": "node --experimental-strip-types --test shared/src/simulation.test.ts"
+    "lint": "eslint shared/src server/src client/src e2e",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "bench:load": "node --experimental-strip-types server/src/loadTest.ts"
   }
 }

@@ -114,7 +114,7 @@ export class Room extends EventEmitter<RoomEvents> {
 
   public addClient(ws: WebSocket, playerInfo: { readonly id: PlayerId; readonly nickname: string }): void {
     const usedSlots = new Set(Array.from(this.clients.values()).map((c) => c.slot));
-    const slot = usedSlots.has(0) ? 1 : 0;
+    let slot = 0; while (usedSlots.has(slot)) slot++;
 
     const fullInfo: RoomClientInfo = {
       id: playerInfo.id,

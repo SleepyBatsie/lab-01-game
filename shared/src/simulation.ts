@@ -7,9 +7,12 @@ import {
   type WorldSnapshot,
   type SnapshotEntity,
   asEntityId,
+  asPlayerId,
   asTickNumber,
   asSeqNumber
 } from './types.ts';
+import { ObjectPool } from './pool.ts';
+import { SpatialHash } from './spatialHash.ts';
 
 export const TICK_RATE = 30;
 export const FIXED_DT = 1 / TICK_RATE;
@@ -33,8 +36,8 @@ export interface PlayerSimState {
 }
 
 export interface BulletSimState {
-  readonly id: EntityId;
-  readonly ownerId: PlayerId;
+  id: EntityId;
+  ownerId: PlayerId;
   x: number;
   y: number;
   vx: number;
@@ -58,6 +61,9 @@ export interface WorldState {
   readonly players: Record<string, PlayerSimState>;
   readonly bullets: BulletSimState[];
   readonly asteroids: AsteroidSimState[];
+  readonly bulletPool: ObjectPool<BulletSimState>;
+  readonly playerGrid: SpatialHash<PlayerSimState>;
+  readonly nearbyPlayersScratch: PlayerSimState[];
 }
 
 export function createRng(seed: number): () => number {
@@ -83,6 +89,28 @@ export function normalizeAngle(angle: number): number {
   return angle;
 }
 
+function createBulletPool(): ObjectPool<BulletSimState> {
+  return new ObjectPool<BulletSimState>(
+    128,
+    () => ({
+      id: asEntityId(0),
+      ownerId: asPlayerId(''),
+      x: 0,
+      y: 0,
+      vx: 0,
+      vy: 0,
+      life: 0
+    }),
+    (b) => {
+      b.life = 0;
+      b.x = 0;
+      b.y = 0;
+      b.vx = 0;
+      b.vy = 0;
+    }
+  );
+}
+
 export function createInitialState(seed = 12345): WorldState {
   const rng = createRng(seed);
   const asteroids: AsteroidSimState[] = [];
@@ -105,13 +133,18 @@ export function createInitialState(seed = 12345): WorldState {
     nextEntityId: 100,
     players: {},
     bullets: [],
-    asteroids
+    asteroids,
+    bulletPool: createBulletPool(),
+    playerGrid: new SpatialHash<PlayerSimState>(WORLD_WIDTH, WORLD_HEIGHT, 80),
+    nearbyPlayersScratch: []
   };
 }
 
 export function addPlayerToState(state: WorldState, id: PlayerId, nickname: string, slot = 0): void {
-  const spawnX = slot === 0 ? 200 : 600;
-  const spawnY = WORLD_HEIGHT / 2;
+  const col = slot % 4;
+  const row = Math.floor(slot / 4) % 3;
+  const spawnX = 160 + col * 160;
+  const spawnY = 150 + row * 150;
   state.players[id] = {
     id,
     nickname,
@@ -120,7 +153,7 @@ export function addPlayerToState(state: WorldState, id: PlayerId, nickname: stri
     y: spawnY,
     vx: 0,
     vy: 0,
-    angle: slot === 0 ? 0 : Math.PI,
+    angle: slot % 2 === 0 ? 0 : Math.PI,
     hp: 5,
     score: 0,
     cooldown: 0,
@@ -134,14 +167,23 @@ export function removePlayerFromState(state: WorldState, id: PlayerId): void {
 }
 
 function respawnPlayer(player: PlayerSimState): void {
+  const col = player.slot % 4;
+  const row = Math.floor(player.slot / 4) % 3;
   player.hp = 5;
-  player.x = player.slot === 0 ? 200 : 600;
-  player.y = WORLD_HEIGHT / 2;
+  player.x = 160 + col * 160;
+  player.y = 150 + row * 150;
   player.vx = 0;
   player.vy = 0;
-  player.angle = player.slot === 0 ? 0 : Math.PI;
+  player.angle = player.slot % 2 === 0 ? 0 : Math.PI;
   player.invuln = 1.5;
 }
+
+const EMPTY_INPUT = {
+  left: false,
+  right: false,
+  thrust: false,
+  fire: false
+} as const;
 
 export function applyPlayerInput(
   state: WorldState,
@@ -181,15 +223,15 @@ export function applyPlayerInput(
     player.cooldown = 0.25;
     if (spawnBullets) {
       const BULLET_SPEED = 480;
-      state.bullets.push({
-        id: asEntityId(state.nextEntityId++),
-        ownerId: player.id,
-        x: wrapCoord(player.x + Math.cos(player.angle) * 18, WORLD_WIDTH),
-        y: wrapCoord(player.y + Math.sin(player.angle) * 18, WORLD_HEIGHT),
-        vx: player.vx + Math.cos(player.angle) * BULLET_SPEED,
-        vy: player.vy + Math.sin(player.angle) * BULLET_SPEED,
-        life: 1.4
-      });
+      const bullet = state.bulletPool.acquire();
+      bullet.id = asEntityId(state.nextEntityId++);
+      bullet.ownerId = player.id;
+      bullet.x = wrapCoord(player.x + Math.cos(player.angle) * 18, WORLD_WIDTH);
+      bullet.y = wrapCoord(player.y + Math.sin(player.angle) * 18, WORLD_HEIGHT);
+      bullet.vx = player.vx + Math.cos(player.angle) * BULLET_SPEED;
+      bullet.vy = player.vy + Math.sin(player.angle) * BULLET_SPEED;
+      bullet.life = 1.4;
+      state.bullets.push(bullet);
     }
   }
 
@@ -205,14 +247,13 @@ export function stepWorld(
 ): void {
   state.tick = asTickNumber(state.tick + 1);
 
-  for (const player of Object.values(state.players)) {
-    const input = inputsByPlayerId.get(player.id) ?? {
-      left: false,
-      right: false,
-      thrust: false,
-      fire: false
-    };
+  state.playerGrid.clear();
+  for (const key in state.players) {
+    const player = state.players[key];
+    if (!player) continue;
+    const input = inputsByPlayerId.get(player.id) ?? EMPTY_INPUT;
     applyPlayerInput(state, player, input, dt, true);
+    state.playerGrid.insert(player, player.x, player.y);
   }
 
   for (let i = state.bullets.length - 1; i >= 0; i--) {
@@ -225,12 +266,15 @@ export function stepWorld(
 
     if (b.life <= 0) {
       state.bullets.splice(i, 1);
+      state.bulletPool.release(b);
       continue;
     }
 
     let hit = false;
-    for (const player of Object.values(state.players)) {
-      if (player.id === b.ownerId || player.hp <= 0 || player.invuln > 0) continue;
+    const candidates = state.playerGrid.queryNear(b.x, b.y, 24, state.nearbyPlayersScratch);
+    for (let c = 0; c < candidates.length; c++) {
+      const player = candidates[c];
+      if (!player || player.id === b.ownerId || player.hp <= 0 || player.invuln > 0) continue;
       const dx = player.x - b.x;
       const dy = player.y - b.y;
       if (dx * dx + dy * dy < 20 * 20) {
@@ -245,10 +289,13 @@ export function stepWorld(
     }
     if (hit) {
       state.bullets.splice(i, 1);
+      state.bulletPool.release(b);
       continue;
     }
 
-    for (const ast of state.asteroids) {
+    for (let a = 0; a < state.asteroids.length; a++) {
+      const ast = state.asteroids[a];
+      if (!ast) continue;
       const dx = ast.x - b.x;
       const dy = ast.y - b.y;
       if (dx * dx + dy * dy < (ast.radius + 6) * (ast.radius + 6)) {
@@ -257,17 +304,22 @@ export function stepWorld(
         ast.x = wrapCoord(ast.x + 260, WORLD_WIDTH);
         ast.y = wrapCoord(ast.y + 170, WORLD_HEIGHT);
         state.bullets.splice(i, 1);
+        state.bulletPool.release(b);
         break;
       }
     }
   }
 
-  for (const ast of state.asteroids) {
+  for (let a = 0; a < state.asteroids.length; a++) {
+    const ast = state.asteroids[a];
+    if (!ast) continue;
     ast.x = wrapCoord(ast.x + ast.vx * dt, WORLD_WIDTH);
     ast.y = wrapCoord(ast.y + ast.vy * dt, WORLD_HEIGHT);
 
-    for (const player of Object.values(state.players)) {
-      if (player.hp <= 0 || player.invuln > 0) continue;
+    const candidates = state.playerGrid.queryNear(ast.x, ast.y, ast.radius + 20, state.nearbyPlayersScratch);
+    for (let c = 0; c < candidates.length; c++) {
+      const player = candidates[c];
+      if (!player || player.hp <= 0 || player.invuln > 0) continue;
       const dx = player.x - ast.x;
       const dy = player.y - ast.y;
       const hitDist = ast.radius + 16;
@@ -290,7 +342,9 @@ export function stepWorld(
 export function buildWorldSnapshot(state: WorldState, serverTime: number): WorldSnapshot {
   const entities: SnapshotEntity[] = [];
 
-  for (const p of Object.values(state.players)) {
+  for (const key in state.players) {
+    const p = state.players[key];
+    if (!p) continue;
     entities.push({
       kind: 'ship',
       slot: p.slot,
@@ -303,7 +357,9 @@ export function buildWorldSnapshot(state: WorldState, serverTime: number): World
     });
   }
 
-  for (const b of state.bullets) {
+  for (let i = 0; i < state.bullets.length; i++) {
+    const b = state.bullets[i];
+    if (!b) continue;
     entities.push({
       kind: 'bullet',
       id: b.id,
@@ -311,7 +367,9 @@ export function buildWorldSnapshot(state: WorldState, serverTime: number): World
     });
   }
 
-  for (const a of state.asteroids) {
+  for (let i = 0; i < state.asteroids.length; i++) {
+    const a = state.asteroids[i];
+    if (!a) continue;
     entities.push({
       kind: 'asteroid',
       id: a.id,
