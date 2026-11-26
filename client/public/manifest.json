@@ -1,0 +1,9 @@
+{
+  "images": {
+    "ship": "/assets/hero.png"
+  },
+  "audio": {
+    "shoot": "https://raw.githubusercontent.com/mdn/webaudio-examples/main/audio-basics/out.mp3"
+  },
+  "config": {}
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@space-game/shared",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "./simulation": "./src/simulation.js",
+    "./protocol": "./src/protocol.js"
+  }
+}
