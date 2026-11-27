@@ -1,6 +1,12 @@
 import { defineConfig } from 'vite';
+import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@space-game/shared': fileURLToPath(new URL('../shared/src/index.ts', import.meta.url))
+    }
+  },
   server: {
     proxy: {
       '/api': {

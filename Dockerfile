@@ -1,4 +1,4 @@
-# Stage 1: Build client bundle (Debian slim avoids musl/rollup issues)
+# Stage 1: Build client bundle
 FROM node:22-slim AS builder
 WORKDIR /app
 
@@ -14,7 +14,7 @@ RUN npm install --no-audit --no-fund
 COPY shared ./shared
 COPY client ./client
 
-RUN npm run build:client
+RUN npm run build --workspace=shared --if-present && npm run build:client
 
 # Stage 2: Minimal production runtime (< 200 MB, non-root)
 FROM node:22-slim AS runner
