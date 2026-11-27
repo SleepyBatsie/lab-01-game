@@ -5,7 +5,7 @@ export default defineConfig({
   resolve: {
     alias: [
       {
-        find: /^@space-game\/shared\/(.+)$/,
+        find: /^@space-game\/shared\/(.+?)(?:\.(?:js|ts))?$/,
         replacement: fileURLToPath(new URL('../shared/src/$1.ts', import.meta.url))
       },
       {
