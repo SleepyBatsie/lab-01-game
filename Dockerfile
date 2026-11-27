@@ -1,5 +1,5 @@
-# Stage 1: Build client bundle
-FROM node:22-alpine AS builder
+# Stage 1: Build client bundle (Debian slim avoids musl/rollup issues)
+FROM node:22-slim AS builder
 WORKDIR /app
 
 ENV NODE_ENV=development
@@ -17,7 +17,7 @@ COPY client ./client
 RUN npm run build:client
 
 # Stage 2: Minimal production runtime (< 200 MB, non-root)
-FROM node:22-alpine AS runner
+FROM node:22-slim AS runner
 WORKDIR /app
 
 ARG BUILD_SHA=unknown
@@ -43,6 +43,6 @@ USER node
 EXPOSE 3000
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:${PORT}/health || exit 1
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 CMD ["node", "--experimental-strip-types", "server/src/index.ts"]
