@@ -19,7 +19,9 @@
     "bench:load": "node --experimental-strip-types server/src/loadTest.ts"
   },
   "devDependencies": {
+    "fast-check": "4.11.0",
     "typescript": "7.0.2",
-    "vite": "8.4.0"
+    "vite": "8.4.0",
+    "vitest": "5.1.2"
   }
 }
