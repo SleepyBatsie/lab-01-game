@@ -19,6 +19,8 @@
     "bench:load": "node --experimental-strip-types server/src/loadTest.ts"
   },
   "devDependencies": {
+    "@types/node": "26.6.11",
+    "@types/ws": "8.18.2",
     "fast-check": "4.11.0",
     "typescript": "7.0.2",
     "vite": "8.4.0",
