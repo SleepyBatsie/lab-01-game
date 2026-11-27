@@ -2,12 +2,14 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 
+ENV NODE_ENV=development
+
 COPY package.json package-lock.json ./
 COPY shared/package.json ./shared/
 COPY server/package.json ./server/
 COPY client/package.json ./client/
 
-RUN npm ci --ignore-scripts
+RUN npm ci --no-audit --no-fund
 
 COPY shared ./shared
 COPY client ./client
@@ -27,7 +29,7 @@ COPY package.json package-lock.json ./
 COPY shared/package.json ./shared/
 COPY server/package.json ./server/
 
-RUN npm ci --omit=dev --ignore-scripts --workspace=shared --workspace=server && npm cache clean --force
+RUN npm ci --omit=dev --no-audit --no-fund --workspace=shared --workspace=server && npm cache clean --force
 
 COPY shared/src ./shared/src
 COPY shared/tsconfig.json ./shared/tsconfig.json
