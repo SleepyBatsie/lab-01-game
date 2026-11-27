@@ -3,9 +3,16 @@ import { fileURLToPath, URL } from 'node:url';
 
 export default defineConfig({
   resolve: {
-    alias: {
-      '@space-game/shared': fileURLToPath(new URL('../shared/src/index.ts', import.meta.url))
-    }
+    alias: [
+      {
+        find: /^@space-game\/shared\/(.+)$/,
+        replacement: fileURLToPath(new URL('../shared/src/$1.ts', import.meta.url))
+      },
+      {
+        find: '@space-game/shared',
+        replacement: fileURLToPath(new URL('../shared/src/index.ts', import.meta.url))
+      }
+    ]
   },
   server: {
     proxy: {
