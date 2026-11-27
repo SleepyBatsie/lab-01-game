@@ -17,5 +17,9 @@
     "test:coverage": "vitest run --coverage",
     "test:e2e": "playwright test",
     "bench:load": "node --experimental-strip-types server/src/loadTest.ts"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vite": "8.4.0"
   }
 }
