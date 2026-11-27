@@ -30,7 +30,7 @@ export type ServerControlMessage =
       readonly ts: number;
     }
   | {
-      readonly type: 'pong_rtt';
+      readonly type: 'pong_rtt' | 'shutdown';
       readonly clientTs: number;
     };
 

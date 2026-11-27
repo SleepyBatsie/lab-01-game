@@ -1,111 +1,169 @@
 import { WebSocketServer, type WebSocket, type RawData } from 'ws';
-import type { Server as HttpServer } from 'node:http';
+import type http from 'node:http';
 import crypto from 'node:crypto';
-import { config } from './config.ts';
-import type { Room } from './Room.ts';
-import { asPlayerId, assertNever, type PlayerId, type RoomId } from '@space-game/shared/types';
+import {
+  type PlayerId,
+  type RoomId,
+  asPlayerId,
+  asRoomId,
+  asSeqNumber,
+  assertNever
+} from '@space-game/shared/types';
 import { parseClientMessage } from '@space-game/shared/schemas';
 import { decodeInputBinary } from '@space-game/shared/protocol';
+import type { Room } from './Room.ts';
+import { config } from './config.ts';
+import { logger } from './logger.ts';
+import { serverMetrics } from './metrics.ts';
+import type { ServerLifecycleState } from './httpServer.ts';
 
 export interface RoomsManager {
-  getOrCreateRoom(roomId: RoomId): Room;
-  listRooms(): Array<{ id: RoomId; name: string; playersCount: number; logFile: string }>;
+  getOrCreateRoom(roomId: RoomId): Room | null;
+  listRooms(): Array<{ readonly id: RoomId; readonly playersCount: number }>;
+  shutdownAll(reason?: string): Promise<void>;
   closeAll(): Promise<void>;
 }
 
-interface GameWebSocket extends WebSocket {
-  id: PlayerId;
-  missedPongs: number;
+export interface GameWebSocket extends WebSocket {
+  playerId: PlayerId;
+  clientIp: string;
   currentRoom: Room | null;
-  msgCount: number;
-  msgWindowStart: number;
+  isAlive: boolean;
+  msgCountWindow: number;
+  windowStart: number;
 }
 
-function rawDataToArrayBuffer(rawData: RawData): ArrayBuffer {
-  if (rawData instanceof ArrayBuffer) {
-    return rawData;
-  }
-  const buf = Array.isArray(rawData) ? Buffer.concat(rawData) : rawData;
-  const copy = new Uint8Array(buf.byteLength);
-  copy.set(buf);
-  return copy.buffer;
+export function isOriginAllowed(originHeader: string | undefined, allowed: readonly string[]): boolean {
+  if (allowed.includes('*')) return true;
+  if (!originHeader) return false;
+  return allowed.includes(originHeader);
 }
 
-export function setupWebSocketServer(httpServer: HttpServer, roomsManager: RoomsManager): WebSocketServer {
+export function setupWebSocketServer(
+  httpServer: http.Server,
+  roomsManager: RoomsManager,
+  lifecycle: ServerLifecycleState = { isShuttingDown: false }
+): WebSocketServer {
+  const ipConnections = new Map<string, number>();
+
   const wss = new WebSocketServer({
     server: httpServer,
     path: '/ws',
-    maxPayload: config.maxPayloadBytes
+    maxPayload: 8 * 1024,
+    verifyClient: (info, done) => {
+      if (lifecycle.isShuttingDown) {
+        done(false, 503, 'Server shutting down');
+        return;
+      }
+      const origin = info.origin;
+      if (!isOriginAllowed(origin, config.ALLOWED_ORIGINS)) {
+        logger.warn({ origin }, 'Rejected WebSocket connection due to disallowed Origin');
+        done(false, 403, 'Origin not allowed');
+        return;
+      }
+      done(true);
+    }
   });
 
-  const pingInterval = setInterval(() => {
+  const heartbeatTimer = setInterval(() => {
     for (const client of wss.clients) {
-      const ws = client as GameWebSocket; // Extend ws instance with session fields
-      if (ws.missedPongs >= 2) {
+      const ws = client as GameWebSocket;
+      if (!ws.isAlive) {
         ws.terminate();
         continue;
       }
-      ws.missedPongs += 1;
+      ws.isAlive = false;
       ws.ping();
     }
-  }, config.pingIntervalMs);
+  }, 15000);
 
   wss.on('close', () => {
-    clearInterval(pingInterval);
+    clearInterval(heartbeatTimer);
   });
 
-  wss.on('connection', (rawWs: WebSocket) => {
-    const ws = rawWs as GameWebSocket; // Extend ws instance with session fields
+  wss.on('connection', (rawWs: WebSocket, req: http.IncomingMessage) => {
+    const ws = rawWs as GameWebSocket;
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const clientIp =
+      typeof forwardedFor === 'string'
+        ? (forwardedFor.split(',')[0]?.trim() ?? 'unknown')
+        : (req.socket.remoteAddress ?? 'unknown');
+
+    const currentIpCount = ipConnections.get(clientIp) ?? 0;
+    if (currentIpCount >= config.MAX_CONNS_PER_IP) {
+      logger.warn({ clientIp, currentIpCount }, 'Rejected WebSocket connection: IP limit exceeded');
+      ws.close(1008, 'Too many connections from this IP');
+      return;
+    }
+    ipConnections.set(clientIp, currentIpCount + 1);
+
     ws.binaryType = 'arraybuffer';
-    ws.id = asPlayerId(crypto.randomUUID().slice(0, 8));
-    ws.missedPongs = 0;
+    ws.playerId = asPlayerId(crypto.randomBytes(4).toString('hex'));
+    ws.clientIp = clientIp;
     ws.currentRoom = null;
-    ws.msgCount = 0;
-    ws.msgWindowStart = Date.now();
+    ws.isAlive = true;
+    ws.msgCountWindow = 0;
+    ws.windowStart = Date.now();
 
     ws.on('pong', () => {
-      ws.missedPongs = 0;
+      ws.isAlive = true;
     });
 
     ws.on('error', (err: unknown) => {
-      console.error(`[WS ${ws.id}] Socket error:`, err);
+      logger.error({ playerId: ws.playerId, err }, 'WebSocket socket error');
     });
 
-    const joinTimer = setTimeout(() => {
+    const joinTimeout = setTimeout(() => {
       if (!ws.currentRoom && ws.readyState === 1) {
         ws.close(1008, 'Join timeout (5s)');
       }
-    }, config.joinTimeoutMs);
+    }, 5000);
 
     ws.on('message', (rawData: RawData, isBinary: boolean) => {
+      const byteLength =
+        rawData instanceof ArrayBuffer
+          ? rawData.byteLength
+          : Array.isArray(rawData)
+            ? rawData.reduce((s, b) => s + b.byteLength, 0)
+            : rawData.byteLength;
+      serverMetrics.recordTraffic(byteLength);
+
       const now = Date.now();
-      if (now - ws.msgWindowStart >= 1000) {
-        ws.msgWindowStart = now;
-        ws.msgCount = 0;
+      if (now - ws.windowStart > 1000) {
+        ws.windowStart = now;
+        ws.msgCountWindow = 0;
       }
-      ws.msgCount++;
-      if (ws.msgCount > 65) {
+      ws.msgCountWindow += 1;
+      if (ws.msgCountWindow > 65) {
+        logger.warn({ playerId: ws.playerId, roomId: ws.currentRoom?.id }, 'Rate limit exceeded');
         ws.close(1008, 'Rate limit exceeded');
         return;
       }
 
       if (isBinary) {
-        if (!ws.currentRoom) return;
         try {
-          const input = decodeInputBinary(rawDataToArrayBuffer(rawData));
-          ws.currentRoom.enqueueInput(ws, input);
-        } catch (err: unknown) {
-          const reason = err instanceof Error ? err.message : 'Invalid binary frame';
-          console.warn(`[WS ${ws.id}] Binary protocol error: ${reason}`);
+          const ab =
+            rawData instanceof ArrayBuffer
+              ? rawData
+              : Buffer.isBuffer(rawData)
+                ? rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength)
+                : new ArrayBuffer(0);
+          const input = decodeInputBinary(ab as ArrayBuffer);
+          if (ws.currentRoom) {
+            ws.currentRoom.enqueueInput(ws, input);
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : 'Bad binary frame';
+          logger.warn({ playerId: ws.playerId, reason }, 'Rejected malformed binary frame');
           ws.close(1003, reason);
         }
         return;
       }
 
-      // Валідація вхідного текстового повідомлення через Zod (без ручних typeof перевірок)
-      const parsed = parseClientMessage(rawData.toString('utf8'));
+      const textStr = Buffer.isBuffer(rawData) ? rawData.toString('utf8') : String(rawData);
+      const parsed = parseClientMessage(textStr);
       if (!parsed.ok) {
-        console.warn(`[WS ${ws.id}] Invalid message: ${parsed.reason}`);
+        logger.warn({ playerId: ws.playerId, reason: parsed.reason }, 'Invalid JSON message');
         ws.close(1003, parsed.reason);
         return;
       }
@@ -117,32 +175,33 @@ export function setupWebSocketServer(httpServer: HttpServer, roomsManager: Rooms
             ws.close(1008, 'Already in a room');
             return;
           }
-          const nickname = msg.nickname && msg.nickname.length > 0 ? msg.nickname : `Player_${ws.id}`;
-          const room = roomsManager.getOrCreateRoom(msg.roomId);
-          clearTimeout(joinTimer);
+          clearTimeout(joinTimeout);
+          const roomId = asRoomId(msg.roomId);
+          const nickname = msg.nickname && msg.nickname.length > 0 ? msg.nickname : `Pilot_${ws.playerId.slice(0, 4)}`;
+          const room = roomsManager.getOrCreateRoom(roomId);
+          if (!room) {
+            ws.close(1013, 'Server room capacity reached');
+            return;
+          }
+          if (room.size >= config.MAX_PLAYERS_PER_ROOM) {
+            ws.close(1008, 'Room is full');
+            return;
+          }
           ws.currentRoom = room;
-
-          room.addClient(ws, { id: ws.id, nickname });
-          ws.send(JSON.stringify({
-            type: 'joined',
-            roomId: room.id,
-            playerId: ws.id,
-            nickname,
-            players: room.getPlayersList()
-          }));
+          room.addClient(ws, { id: ws.playerId, nickname });
           break;
         }
 
         case 'input': {
-          if (!ws.currentRoom) return;
-          ws.currentRoom.enqueueInput(ws, {
-            seq: msg.seq,
-            left: msg.left,
-            right: msg.right,
-            thrust: msg.thrust,
-            fire: msg.fire,
-            clientTs: msg.clientTs
-          });
+          if (ws.currentRoom) {
+            ws.currentRoom.enqueueInput(ws, {
+              seq: asSeqNumber(msg.seq),
+              left: msg.left,
+              right: msg.right,
+              thrust: msg.thrust,
+              fire: msg.fire
+            });
+          }
           break;
         }
 
@@ -182,7 +241,14 @@ export function setupWebSocketServer(httpServer: HttpServer, roomsManager: Rooms
     });
 
     ws.on('close', () => {
-      clearTimeout(joinTimer);
+      clearTimeout(joinTimeout);
+      const count = ipConnections.get(ws.clientIp) ?? 1;
+      if (count <= 1) {
+        ipConnections.delete(ws.clientIp);
+      } else {
+        ipConnections.set(ws.clientIp, count - 1);
+      }
+
       if (ws.currentRoom) {
         ws.currentRoom.removeClient(ws);
         ws.currentRoom = null;

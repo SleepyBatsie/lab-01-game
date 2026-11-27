@@ -27,7 +27,7 @@ async function runStage(clientCount: number): Promise<{ clients: number; avgTick
       }
       return r;
     },
-    listRooms: () => [],
+    listRooms: () => [], shutdownAll: async () => {},
     closeAll: async () => {
       for (const r of rooms.values()) await r.close();
       rooms.clear();

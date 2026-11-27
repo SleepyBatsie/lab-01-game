@@ -1,8 +1,11 @@
 import { EventEmitter } from 'node:events';
 import type { WebSocket } from 'ws';
-import { MatchLogger } from './matchLogger.ts';
-import { config } from './config.ts';
-import type { PlayerId, RoomId, PlayerInput } from '@space-game/shared/types';
+import {
+  type PlayerId,
+  type RoomId,
+  type PlayerInput,
+  asPlayerId
+} from '@space-game/shared/types';
 import {
   TICK_RATE,
   FIXED_DT,
@@ -14,219 +17,192 @@ import {
   type WorldState
 } from '@space-game/shared/simulation';
 import { encodeSnapshotBinary } from '@space-game/shared/protocol';
+import { logger } from './logger.ts';
+import { serverMetrics } from './metrics.ts';
 
-const STEP_MS = 1000 / TICK_RATE;
-
-export interface RoomClientInfo {
+export interface RoomClientMeta {
   readonly id: PlayerId;
   readonly nickname: string;
-  readonly slot: number;
-  useBinary: boolean;
-  readonly inputQueue: PlayerInput[];
-  lastInput: PlayerInput | null;
+  binaryMode: boolean;
 }
 
 export interface RoomEvents {
   empty: [roomId: RoomId];
-  error: [err: unknown];
 }
 
 export class Room extends EventEmitter<RoomEvents> {
   public readonly id: RoomId;
-  public readonly name: string;
-  private readonly clients = new Map<WebSocket, RoomClientInfo>();
-  private readonly logger: MatchLogger;
+  private readonly clients = new Map<WebSocket, RoomClientMeta>();
   private readonly state: WorldState;
-  private running = true;
-  private tickTimer: NodeJS.Timeout | null = null;
-  private nextTickAt: number;
+  private readonly latestInputs = new Map<PlayerId, PlayerInput>();
+  private readonly tickInterval: NodeJS.Timeout;
+  private closed = false;
 
-  constructor(id: RoomId, name = `Room ${id}`) {
+  constructor(id: RoomId) {
     super();
     this.id = id;
-    this.name = name;
-    this.logger = new MatchLogger(id);
-
-    const seed = Math.floor(Math.random() * 1000000);
+    const seed = Array.from(id).reduce((acc, ch) => acc + ch.charCodeAt(0), 1000);
     this.state = createInitialState(seed);
-    this.nextTickAt = performance.now() + STEP_MS;
 
-    this.on('error', (err: unknown) => {
-      console.error(`[Room ${this.id}] Error:`, err);
-    });
-
-    this.logger.logEvent({ type: 'room_created', roomId: this.id, name: this.name, seed });
-    this.scheduleNextTick();
+    this.tickInterval = setInterval(() => {
+      this.stepSimulation();
+    }, 1000 / TICK_RATE);
   }
 
   public get size(): number {
     return this.clients.size;
   }
 
-  private scheduleNextTick(): void {
-    if (!this.running) return;
-    const now = performance.now();
-    const delay = Math.max(0, this.nextTickAt - now);
+  public addClient(ws: WebSocket, meta: { readonly id: PlayerId; readonly nickname: string }): void {
+    const usedSlots = new Set(Object.values(this.state.players).map((p) => p.slot));
+    let slot = 0;
+    while (usedSlots.has(slot)) slot++;
 
-    this.tickTimer = setTimeout(() => {
-      if (!this.running) return;
-      this.stepSimulation();
-      this.nextTickAt += STEP_MS;
-      if (performance.now() - this.nextTickAt > 200) {
-        this.nextTickAt = performance.now() + STEP_MS;
-      }
-      this.scheduleNextTick();
-    }, delay);
-  }
-
-  private stepSimulation(): void {
-    if (this.clients.size === 0) return;
-
-    const inputsByPlayerId = new Map<PlayerId, PlayerInput>();
-    for (const info of this.clients.values()) {
-      const nextInput = info.inputQueue.shift();
-      if (nextInput) {
-        inputsByPlayerId.set(info.id, nextInput);
-      } else if (info.lastInput) {
-        inputsByPlayerId.set(info.id, { ...info.lastInput, fire: false });
-      }
-    }
-
-    stepWorld(this.state, inputsByPlayerId, FIXED_DT);
-    this.broadcastSnapshot();
-  }
-
-  public enqueueInput(ws: WebSocket, input: PlayerInput): void {
-    const info = this.clients.get(ws);
-    if (!info) return;
-    if (info.inputQueue.length < 15) {
-      info.inputQueue.push(input);
-    }
-    info.lastInput = input;
-  }
-
-  public setProtocolMode(ws: WebSocket, useBinary: boolean): void {
-    const info = this.clients.get(ws);
-    if (info) {
-      info.useBinary = useBinary;
-    }
-  }
-
-  public addClient(ws: WebSocket, playerInfo: { readonly id: PlayerId; readonly nickname: string }): void {
-    const usedSlots = new Set(Array.from(this.clients.values()).map((c) => c.slot));
-    let slot = 0; while (usedSlots.has(slot)) slot++;
-
-    const fullInfo: RoomClientInfo = {
-      id: playerInfo.id,
-      nickname: playerInfo.nickname,
-      slot,
-      useBinary: true,
-      inputQueue: [],
-      lastInput: null
+    const clientMeta: RoomClientMeta = {
+      id: meta.id,
+      nickname: meta.nickname,
+      binaryMode: true
     };
+    this.clients.set(ws, clientMeta);
+    addPlayerToState(this.state, meta.id, meta.nickname, slot);
 
-    this.clients.set(ws, fullInfo);
-    addPlayerToState(this.state, playerInfo.id, playerInfo.nickname, slot);
-    this.logger.logEvent({ type: 'join', player: { id: playerInfo.id, nickname: playerInfo.nickname, slot } });
+    logger.info({ roomId: this.id, playerId: meta.id, nickname: meta.nickname, slot }, 'Player joined room');
 
-    ws.send(JSON.stringify({
+    this.sendJson(ws, {
       type: 'init_world',
       seed: this.state.seed,
       slot,
       tickRate: TICK_RATE,
       asteroids: this.state.asteroids
-    }));
+    });
 
-    this.broadcast({
+    this.sendJson(ws, {
+      type: 'joined',
+      roomId: this.id,
+      playerId: meta.id,
+      nickname: meta.nickname,
+      players: this.getPlayersList()
+    });
+
+    this.broadcastJson({
       type: 'system',
-      text: `${playerInfo.nickname} (Slot ${slot + 1}) приєднався до кімнати`,
+      text: `${meta.nickname} приєднався до кімнати`,
       players: this.getPlayersList()
     });
   }
 
+  public setProtocolMode(ws: WebSocket, binary: boolean): void {
+    const meta = this.clients.get(ws);
+    if (meta) {
+      meta.binaryMode = binary;
+    }
+  }
+
+  public enqueueInput(ws: WebSocket, input: PlayerInput): void {
+    const meta = this.clients.get(ws);
+    if (!meta) return;
+    const prev = this.latestInputs.get(meta.id);
+    if (!prev || input.seq > prev.seq) {
+      this.latestInputs.set(meta.id, input);
+    }
+  }
+
   public removeClient(ws: WebSocket): void {
-    const player = this.clients.get(ws);
-    if (!player) return;
+    const meta = this.clients.get(ws);
+    if (!meta) return;
 
     this.clients.delete(ws);
-    removePlayerFromState(this.state, player.id);
-    this.logger.logEvent({ type: 'leave', player: { id: player.id, nickname: player.nickname } });
+    this.latestInputs.delete(meta.id);
+    removePlayerFromState(this.state, meta.id);
+
+    logger.info({ roomId: this.id, playerId: meta.id, nickname: meta.nickname }, 'Player left room');
 
     if (this.clients.size === 0) {
       void this.close().then(() => {
         this.emit('empty', this.id);
       });
     } else {
-      this.broadcast({
+      this.broadcastJson({
         type: 'system',
-        text: `${player.nickname} вийшов із кімнати`,
+        text: `${meta.nickname} вийшов із кімнати`,
         players: this.getPlayersList()
       });
     }
   }
 
   public handleChat(ws: WebSocket, text: string): void {
-    const player = this.clients.get(ws);
-    if (!player) return;
-
-    const payload = {
+    const meta = this.clients.get(ws);
+    if (!meta) return;
+    this.broadcastJson({
       type: 'chat',
-      from: player.nickname,
-      playerId: player.id,
+      id: asPlayerId(`${Date.now()}_${meta.id}`),
+      from: meta.nickname,
       text,
       ts: Date.now()
-    };
-
-    this.logger.logEvent(payload);
-    this.broadcast(payload);
+    });
   }
 
-  private broadcastSnapshot(): void {
-    const snapshot = buildWorldSnapshot(this.state, performance.now());
+  private stepSimulation(): void {
+    const t0 = performance.now();
+    stepWorld(this.state, this.latestInputs, FIXED_DT);
+    const snapshot = buildWorldSnapshot(this.state, Date.now());
+    const binaryBuffer = encodeSnapshotBinary(snapshot);
+    let jsonCache: string | null = null;
 
-    let binaryBuf: ArrayBuffer | null = null;
-    let jsonStr: string | null = null;
+    for (const [ws, meta] of this.clients.entries()) {
+      if (ws.readyState !== 1) continue;
+      if (ws.bufferedAmount > 65536) continue;
 
-    for (const [clientWs, info] of this.clients) {
-      if (clientWs.readyState !== 1) continue;
-      if (clientWs.bufferedAmount > config.maxBufferedAmount) continue;
-
-      if (info.useBinary) {
-        if (!binaryBuf) binaryBuf = encodeSnapshotBinary(snapshot);
-        clientWs.send(binaryBuf);
+      if (meta.binaryMode) {
+        ws.send(binaryBuffer);
       } else {
-        if (!jsonStr) jsonStr = JSON.stringify(snapshot);
-        clientWs.send(jsonStr);
+        if (jsonCache === null) {
+          jsonCache = JSON.stringify(snapshot);
+        }
+        ws.send(jsonCache);
+      }
+    }
+    serverMetrics.recordStepDuration(performance.now() - t0);
+  }
+
+  public getPlayersList(): Array<{ readonly id: PlayerId; readonly nickname: string; readonly slot: number }> {
+    return Object.values(this.state.players).map((p) => ({
+      id: p.id,
+      nickname: p.nickname,
+      slot: p.slot
+    }));
+  }
+
+  private sendJson(ws: WebSocket, payload: unknown): void {
+    if (ws.readyState === 1) {
+      ws.send(JSON.stringify(payload));
+    }
+  }
+
+  private broadcastJson(payload: unknown): void {
+    const serialized = JSON.stringify(payload);
+    for (const ws of this.clients.keys()) {
+      if (ws.readyState === 1) {
+        ws.send(serialized);
       }
     }
   }
 
-  public broadcast(data: unknown, excludeWs: WebSocket | null = null): void {
-    const raw = JSON.stringify(data);
-    for (const clientWs of this.clients.keys()) {
-      if (clientWs === excludeWs || clientWs.readyState !== 1) continue;
-      if (clientWs.bufferedAmount > config.maxBufferedAmount) continue;
-      clientWs.send(raw);
+  public async shutdownRoom(reason = 'Server shutting down'): Promise<void> {
+    this.broadcastJson({ type: 'shutdown', reason });
+    for (const ws of this.clients.keys()) {
+      if (ws.readyState === 1) {
+        ws.close(1001, reason);
+      }
     }
-  }
-
-  public getPlayersList(): Array<{ id: PlayerId; nickname: string; slot: number }> {
-    return Array.from(this.clients.values()).map(({ id, nickname, slot }) => ({ id, nickname, slot }));
-  }
-
-  public toJSON(): { id: RoomId; name: string; playersCount: number; logFile: string } {
-    return {
-      id: this.id,
-      name: this.name,
-      playersCount: this.clients.size,
-      logFile: this.logger.filePath
-    };
+    await this.close();
   }
 
   public async close(): Promise<void> {
-    this.running = false;
-    if (this.tickTimer) clearTimeout(this.tickTimer);
-    this.logger.logEvent({ type: 'room_closed', roomId: this.id });
-    await this.logger.close();
+    if (this.closed) return;
+    this.closed = true;
+    clearInterval(this.tickInterval);
+    this.clients.clear();
+    this.latestInputs.clear();
   }
 }

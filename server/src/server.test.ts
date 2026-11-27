@@ -126,7 +126,7 @@ describe('Server Room & Simulation Loop (with fake timers)', () => {
         if (!r) { r = new Room(id); rooms.set(id, r); }
         return r;
       },
-      listRooms: () => [],
+      listRooms: () => [], shutdownAll: async () => {},
       closeAll: async () => {
         for (const r of rooms.values()) await r.close();
       }
@@ -158,7 +158,7 @@ describe('Server Room & Simulation Loop (with fake timers)', () => {
   it('closes socket with code 1003 on malformed JSON message', async () => {
     const manager: RoomsManager = {
       getOrCreateRoom: (id) => new Room(id),
-      listRooms: () => [],
+      listRooms: () => [], shutdownAll: async () => {},
       closeAll: async () => {}
     };
     const httpServer = createAppHttpServer(manager, '.');

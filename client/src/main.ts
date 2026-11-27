@@ -136,7 +136,7 @@ const pendingSpawnEvents: Array<{ x: number; y: number; count: number }> = [];
 if (typeof Worker !== 'undefined') {
   particleWorker = new Worker(new URL('./particleWorker.ts', import.meta.url), { type: 'module' });
   particleWorker.onmessage = (e: MessageEvent<Float32Array>) => {
-    workerParticlesBuffer = e.data;
+    workerParticlesBuffer = e.data as Float32Array<ArrayBuffer>;
   };
 }
 
@@ -220,10 +220,31 @@ function appendChat(html: string, isSystem = false): void {
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
 }
 
+function returnToLobbyOnDisconnect(notice: string): void {
+  if (!inRoom) return;
+  inRoom = false;
+  myPlayerId = null;
+  pendingInputs.length = 0;
+  snapshotBuffer.length = 0;
+  for (const bot of activeBots) bot.stop();
+  activeBots = [];
+  botsBtn.textContent = 'Запустити 8 ботів';
+  roomViewEl.classList.add('hidden');
+  lobbyViewEl.classList.remove('hidden');
+  lobby.startPolling();
+  const li = document.createElement('li');
+  li.className = 'empty';
+  li.textContent = notice;
+  roomsListEl.prepend(li);
+}
+
 socket.addEventListener('status', (e: Event) => {
-  const status = (e as CustomEvent<string>).detail; // Typed CustomEvent payload
+  const status = (e as CustomEvent<string>).detail;
   wsStatusEl.textContent = status;
   wsStatusEl.className = status === 'connected' ? 'badge connected' : 'badge offline';
+  if (status === 'disconnected' && inRoom) {
+    returnToLobbyOnDisconnect('Зʼєднання з сервером втрачено — повернено в лобі.');
+  }
 });
 
 socket.addEventListener('message', (e: Event) => {
@@ -281,6 +302,9 @@ socket.addEventListener('message', (e: Event) => {
     }
 
     case 'pong_rtt':
+      break;
+    case 'shutdown':
+      returnToLobbyOnDisconnect('Сервер перезавантажується — ви повернулись у лобі.');
       break;
 
     default:
@@ -687,3 +711,4 @@ chatForm.addEventListener('submit', (e: SubmitEvent) => {
 
 lobby.startPolling();
 requestAnimationFrame(renderLoop);
+if ('serviceWorker' in navigator) { window.addEventListener('load', () => { void navigator.serviceWorker.register('/sw.js'); }); }

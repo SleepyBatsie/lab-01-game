@@ -1,27 +1,33 @@
 import { z } from 'zod';
 
-const EnvConfigSchema = z.object({
+const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-  HOST: z.string().min(1).default('0.0.0.0'),
-  LOGS_DIR: z.string().min(1).default('logs'),
-  MAX_PAYLOAD_BYTES: z.coerce.number().int().positive().default(64 * 1024),
-  MAX_BUFFERED_AMOUNT: z.coerce.number().int().positive().default(1024 * 1024),
-  PING_INTERVAL_MS: z.coerce.number().int().positive().default(15000),
-  JOIN_TIMEOUT_MS: z.coerce.number().int().positive().default(5000)
+  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+  ALLOWED_ORIGINS: z
+    .string()
+    .default('*')
+    .transform((val) =>
+      val === '*'
+        ? ['*']
+        : val
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+    ),
+  MAX_CONNS_PER_IP: z.coerce.number().int().min(1).max(1000).default(12),
+  MAX_ROOMS: z.coerce.number().int().min(1).max(1000).default(50),
+  MAX_PLAYERS_PER_ROOM: z.coerce.number().int().min(2).max(256).default(16),
+  BUILD_SHA: z.string().min(1).default('dev-local')
 });
 
-const parsed = EnvConfigSchema.safeParse(process.env);
-if (!parsed.success) {
-  console.error('Invalid server environment configuration:', parsed.error.format());
-  process.exit(1);
+export type AppConfig = z.infer<typeof envSchema>;
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+  const parsed = envSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new Error(`Invalid environment configuration: ${parsed.error.message}`);
+  }
+  return parsed.data;
 }
 
-export const config = {
-  port: parsed.data.PORT,
-  host: parsed.data.HOST,
-  logsDir: parsed.data.LOGS_DIR,
-  maxPayloadBytes: parsed.data.MAX_PAYLOAD_BYTES,
-  maxBufferedAmount: parsed.data.MAX_BUFFERED_AMOUNT,
-  pingIntervalMs: parsed.data.PING_INTERVAL_MS,
-  joinTimeoutMs: parsed.data.JOIN_TIMEOUT_MS
-} as const;
+export const config: AppConfig = loadConfig();
